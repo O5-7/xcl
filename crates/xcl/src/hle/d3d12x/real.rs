@@ -2249,6 +2249,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
+        super::vram::untrack_srv(slot.pc_srv);
         let va = v.Anonymous.RaytracingAccelerationStructure.Location;
         let in_uma = va != 0 && crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
         if in_uma {
@@ -2302,10 +2303,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
-    if !res.is_null() {
-        if let Some(orig) = track_orig {
-            super::vram::track_srv(this as usize, res as usize, slot.pc_srv, slot.shared_srv, orig);
-        }
+    match (!buf_delta_null && !res.is_null()).then_some(track_orig).flatten() {
+        Some(orig) => super::vram::track_srv(this as usize, res as usize, slot.pc_srv, slot.shared_srv, orig),
+        None => super::vram::untrack_srv(slot.pc_srv),
     }
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);

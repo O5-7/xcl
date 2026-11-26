@@ -1368,15 +1368,57 @@ fn remove_slot_from_tracked(ts: &mut TrackedSrvs, pc_srv: u64) {
     }
 }
 
+impl TrackedSrvs {
+    fn track(&mut self, resource: usize, is_placed: bool, pc_srv: u64, orig_desc: D3D12_SHADER_RESOURCE_VIEW_DESC) {
+        if pc_srv == 0 {
+            return;
+        }
+        remove_slot_from_tracked(self, pc_srv);
+        if resource == 0 || !is_placed {
+            return;
+        }
+        self.by_slot.insert(pc_srv, resource);
+        self.by_res.entry(resource).or_default().push(TrackedSrv { pc_srv, orig_desc });
+    }
+
+    fn untrack(&mut self, pc_srv: u64) {
+        if pc_srv != 0 {
+            remove_slot_from_tracked(self, pc_srv);
+        }
+    }
+
+    fn copy(&mut self, src_pc_srv: u64, dst_pc_srv: u64) {
+        if src_pc_srv == 0 || dst_pc_srv == 0 {
+            return;
+        }
+        remove_slot_from_tracked(self, dst_pc_srv);
+        let Some(&res) = self.by_slot.get(&src_pc_srv) else { return };
+        let Some(entry) = self.by_res.get(&res).and_then(|v| v.iter().find(|e| e.pc_srv == src_pc_srv).copied()) else { return };
+        self.by_slot.insert(dst_pc_srv, res);
+        self.by_res.entry(res).or_default().push(TrackedSrv {
+            pc_srv: dst_pc_srv,
+            orig_desc: entry.orig_desc,
+        });
+    }
+}
+
 pub(super) fn track_srv(_device: usize, resource: usize, pc_srv: u64, _shared_srv: u64, orig_desc: D3D12_SHADER_RESOURCE_VIEW_DESC) {
-    if !budget_evict_enabled() || resource == 0 || pc_srv == 0 || !is_placed_texture(resource) {
+    if !budget_evict_enabled() || pc_srv == 0 {
+        return;
+    }
+    let placed = resource != 0 && is_placed_texture(resource);
+    let mut g = TRACKED_SRVS.lock().unwrap();
+    g.get_or_insert_with(TrackedSrvs::default).track(resource, placed, pc_srv, orig_desc);
+}
+
+pub(super) fn untrack_srv(pc_srv: u64) {
+    if !budget_evict_enabled() || pc_srv == 0 {
         return;
     }
     let mut g = TRACKED_SRVS.lock().unwrap();
-    let ts = g.get_or_insert_with(TrackedSrvs::default);
-    remove_slot_from_tracked(ts, pc_srv);
-    ts.by_slot.insert(pc_srv, resource);
-    ts.by_res.entry(resource).or_default().push(TrackedSrv { pc_srv, orig_desc });
+    if let Some(ts) = g.as_mut() {
+        ts.untrack(pc_srv);
+    }
 }
 
 pub(super) fn copy_tracked_srv(src_pc_srv: u64, dst_pc_srv: u64, _dst_shared_srv: u64) {
@@ -1384,15 +1426,7 @@ pub(super) fn copy_tracked_srv(src_pc_srv: u64, dst_pc_srv: u64, _dst_shared_srv
         return;
     }
     let mut g = TRACKED_SRVS.lock().unwrap();
-    let ts = g.get_or_insert_with(TrackedSrvs::default);
-    remove_slot_from_tracked(ts, dst_pc_srv);
-    let Some(&res) = ts.by_slot.get(&src_pc_srv) else { return };
-    let Some(entry) = ts.by_res.get(&res).and_then(|v| v.iter().find(|e| e.pc_srv == src_pc_srv).copied()) else { return };
-    ts.by_slot.insert(dst_pc_srv, res);
-    ts.by_res.entry(res).or_default().push(TrackedSrv {
-        pc_srv: dst_pc_srv,
-        orig_desc: entry.orig_desc,
-    });
+    g.get_or_insert_with(TrackedSrvs::default).copy(src_pc_srv, dst_pc_srv);
 }
 
 fn forget_tracked_srvs(resource: usize) {
@@ -2682,5 +2716,33 @@ void main() {
         let expected_pinned_heap = *pinned_heaps.iter().next().unwrap();
         assert_eq!(reclaimed, vec![expected_top_heap], "evictable heap must reclaim 100%");
         assert!(!reclaimed.contains(&expected_pinned_heap), "pinned tail heap remains live");
+    }
+
+    #[test]
+    fn tracked_srv_overwrite_with_null_or_non_placed_clears_slot_before_copy() {
+        let srv_2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let (res_a, non_placed, slot_s, slot_d) = (0xA000usize, 0xB000usize, 0x100u64, 0x200u64);
+        let mut ts = TrackedSrvs::default();
+
+        // Placed -> null overwrite -> copy must leave both slots untracked.
+        ts.track(res_a, true, slot_s, srv_2d);
+        assert_eq!(ts.by_slot.get(&slot_s), Some(&res_a));
+        ts.untrack(slot_s);
+        ts.copy(slot_s, slot_d);
+        assert!(!ts.by_slot.contains_key(&slot_s));
+        assert!(!ts.by_slot.contains_key(&slot_d));
+        assert!(!ts.by_res.contains_key(&res_a));
+
+        // Placed -> non-placed overwrite -> copy must also clear A from S and not propagate to D.
+        ts.track(res_a, true, slot_s, srv_2d);
+        ts.track(non_placed, false, slot_s, srv_2d);
+        ts.copy(slot_s, slot_d);
+        assert!(!ts.by_slot.contains_key(&slot_s));
+        assert!(!ts.by_slot.contains_key(&slot_d));
+        assert!(!ts.by_res.contains_key(&res_a));
+        assert!(!ts.by_res.contains_key(&non_placed));
     }
 }
