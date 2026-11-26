@@ -1958,9 +1958,13 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
     super::console_heap::publish_range(&d0, n);
     let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
+    let track_srvs = !d0.sampler && super::vram::budget_evict_enabled();
     for k in 0..n as u64 {
         if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
             copy_words(&s, &d);
+            if track_srvs {
+                super::vram::copy_tracked_srv(s.pc_srv, d.pc_srv, d.shared_srv);
+            }
         }
     }
     true
@@ -2267,6 +2271,24 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
+    let track_orig = if super::vram::budget_evict_enabled() && !res.is_null() {
+        let base = desc.as_ref().copied().or_else(|| {
+            ID3D12Resource::from_raw_borrowed(&res).and_then(|r| super::vram::default_srv_desc(&r.GetDesc()))
+        });
+        base.filter(|v| v.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
+    } else {
+        None
+    };
+    let mut clamped_copy = None;
+    if let Some(orig) = track_orig {
+        let min_mip = super::vram::resident_min_mip(res as usize);
+        if min_mip > 0 {
+            let mut clamped = orig;
+            super::vram::clamp_srv_min_lod(&mut clamped, min_mip);
+            clamped_copy = Some(clamped);
+        }
+    }
+    let pc_desc = clamped_copy.as_ref().map_or(desc, |v| v as *const _);
     if buf_delta_null {
         let null_buf = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
@@ -2276,10 +2298,15 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         };
         f(this, std::ptr::null_mut(), &null_buf, slot.pc_srv);
     } else {
-        f(this, res, desc, slot.pc_srv);
+        f(this, res, pc_desc, slot.pc_srv);
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
+    if !res.is_null() {
+        if let Some(orig) = track_orig {
+            super::vram::track_srv(this as usize, res as usize, slot.pc_srv, slot.shared_srv, orig);
+        }
+    }
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {

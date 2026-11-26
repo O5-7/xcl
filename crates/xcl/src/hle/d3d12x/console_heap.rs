@@ -387,6 +387,10 @@ pub fn unregister(obj: usize) {
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
+        if !h.sampler && super::vram::budget_evict_enabled() {
+            let span = (2 * h.n as u64) * (h.inc as u64);
+            super::vram::forget_srv_range(h.pc_cpu, h.pc_cpu.saturating_add(span));
+        }
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             if h.sampler {
                 release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
