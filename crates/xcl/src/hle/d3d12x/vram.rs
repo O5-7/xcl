@@ -233,7 +233,7 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
-    /// virtual, resident, and SRV-sampled texel accounting for sampled placed textures (`None` for GPU-owned targets)
+    /// virtual, resident, and created-SRV texel accounting for sampled placed textures (`None` for GPU-owned targets)
     texels: Option<TexelMeta>,
 }
 
@@ -315,14 +315,15 @@ fn level_stats() -> (u64, u64, u64, u64) {
     (l(0), l(1), l(2), l(3))
 }
 
-/// Snapshot of placed sampled-texture residency and SRV mip coverage (`XCL_ACTIVITY`).
+/// Snapshot of placed sampled-texture residency and lifetime created-SRV subresource coverage (`XCL_ACTIVITY`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TexelStats {
     pub sampled_textures: u64,
     pub srv_textures: u64,
     pub total_texels: u64,
     pub resident_texels: u64,
-    pub srv_sampled_texels: u64,
+    /// Union of texels across all SRVs created for still-live placed sampled textures (cumulative over their lifetime, not shader-observed sampling).
+    pub srv_covered_texels: u64,
 }
 
 static TEXEL_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -334,7 +335,7 @@ pub fn texel_stats() -> TexelStats {
         srv_textures: l(1),
         total_texels: l(2),
         resident_texels: l(3),
-        srv_sampled_texels: l(4),
+        srv_covered_texels: l(4),
     }
 }
 
@@ -457,7 +458,7 @@ struct TexelMeta {
     srv_mask: u32,
     srv_extra_slices: Vec<u32>,
     had_srv: bool,
-    srv_sampled_texels: u64,
+    srv_covered_texels: u64,
 }
 
 impl TexelMeta {
@@ -475,7 +476,7 @@ impl TexelMeta {
             srv_mask: 0,
             srv_extra_slices: Vec::new(),
             had_srv: false,
-            srv_sampled_texels: 0,
+            srv_covered_texels: 0,
         }
     }
 
@@ -521,7 +522,7 @@ impl TexelMeta {
         }
         let first_srv = !self.had_srv;
         self.had_srv = true;
-        self.srv_sampled_texels = self.srv_sampled_texels.saturating_add(added);
+        self.srv_covered_texels = self.srv_covered_texels.saturating_add(added);
         (first_srv, added)
     }
 }
@@ -1343,8 +1344,8 @@ fn forget_pages(resource: usize) {
             TEXEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             if tm.had_srv {
                 TEXEL_STATS[1].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                if tm.srv_sampled_texels > 0 {
-                    TEXEL_STATS[4].fetch_sub(tm.srv_sampled_texels, std::sync::atomic::Ordering::Relaxed);
+                if tm.srv_covered_texels > 0 {
+                    TEXEL_STATS[4].fetch_sub(tm.srv_covered_texels, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             if tm.total_texels > 0 {
@@ -1618,7 +1619,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
     Vec::new()
 }
 
-/// Record which mip levels of placed sampled texture `resource` an SRV can sample.
+/// Record the subresource texels covered by a newly created SRV for placed sampled texture `resource` (cumulative lifetime union).
 pub(super) fn note_srv(resource: usize, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) {
     if resource == 0 || !is_placed_texture(resource) {
         return;
@@ -2549,7 +2550,7 @@ mod tests {
         };
         assert_eq!(tm.record_srv(Some(&srv_all)), (false, 64 + 1));
         assert_eq!(tm.record_srv(Some(&srv_all)), (false, 0));
-        assert_eq!(tm.srv_sampled_texels, tm.total_texels);
+        assert_eq!(tm.srv_covered_texels, tm.total_texels);
     }
 
     #[test]
@@ -2580,7 +2581,7 @@ mod tests {
         assert_eq!(tm.record_srv(Some(&slice_srv(0))), (true, 4096));
         assert_eq!(tm.record_srv(Some(&slice_srv(0))), (false, 0));
         assert_eq!(tm.record_srv(Some(&slice_srv(1))), (false, 4096));
-        assert_eq!(tm.srv_sampled_texels, 8192);
+        assert_eq!(tm.srv_covered_texels, 8192);
     }
 
     #[test]
