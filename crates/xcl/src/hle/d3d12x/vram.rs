@@ -319,6 +319,10 @@ pub(super) fn level_pages() -> bool {
 #[cfg(test)]
 pub(super) static LEVEL_PAGES_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Force `budget_evict_enabled()` on for a test (under `VRAM_TEST_LOCK`)
+#[cfg(test)]
+pub(super) static BUDGET_EVICT_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Of the textures with lazy levels there are now: how many, the tiles they stand for, and the
 /// tiles of them that have pages; and the level groups given pages so far.
 static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
@@ -333,6 +337,10 @@ fn level_stats() -> (u64, u64, u64, u64) {
 /// `XCL_TEXTURE_BUDGET_EVICT=1` (off by default): track live SRVs and isolate evictable top mip
 /// tiles into a dedicated pool class for local VRAM budget eviction.
 pub(super) fn budget_evict_enabled() -> bool {
+    #[cfg(test)]
+    if BUDGET_EVICT_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var("XCL_TEXTURE_BUDGET_EVICT").is_ok_and(|v| v.trim() == "1");
@@ -409,6 +417,13 @@ impl TilePool {
         self.dirty_sort[idx] = false;
         self.heap_evictable[idx] = evictable;
         self.free_total += pool_pages as usize;
+    }
+
+    /// Demote pool heap `slot` out of the evictable class once any pinned tile aliases into it.
+    fn mark_heap_pinned(&mut self, slot: u32) {
+        if let Some(ev) = self.heap_evictable.get_mut(slot as usize) {
+            *ev = false;
+        }
     }
 
     /// Reclaim completely empty cooled heaps (`free_by_heap[h].len() == pool_pages`), keeping up
@@ -867,8 +882,14 @@ impl Pages {
                 self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
             };
             match existing {
-                Some(h) if preferred.is_none() => preferred = Some(h),
-                Some(_) => {}
+                Some(h) => {
+                    if !evictable {
+                        self.pool.mark_heap_pinned(h);
+                    }
+                    if preferred.is_none() {
+                        preferred = Some(h);
+                    }
+                }
                 None => missing += 1,
             }
         }
@@ -1449,6 +1470,23 @@ pub(super) fn forget_srv_range(lo: u64, hi: u64) {
     let doomed: Vec<u64> = ts.by_slot.keys().copied().filter(|&k| k >= lo && k < hi).collect();
     for slot in doomed {
         remove_slot_from_tracked(ts, slot);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn tracked_srv_resource(pc_srv: u64) -> Option<usize> {
+    TRACKED_SRVS.lock().unwrap().as_ref().and_then(|ts| ts.by_slot.get(&pc_srv).copied())
+}
+
+#[cfg(test)]
+pub(super) fn note_placed_texture_for_test(resource: usize) {
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(resource);
+}
+
+#[cfg(test)]
+pub(super) fn forget_placed_texture_for_test(resource: usize) {
+    if let Some(textures) = PLACED_TEXTURES.lock().unwrap().as_mut() {
+        textures.remove(&resource);
     }
 }
 
@@ -2744,5 +2782,100 @@ void main() {
         assert!(!ts.by_slot.contains_key(&slot_d));
         assert!(!ts.by_res.contains_key(&res_a));
         assert!(!ts.by_res.contains_key(&non_placed));
+    }
+
+    /// GPU: aliasing a pinned (`!evictable`) bind onto a guest page backed by an evictable pool
+    /// heap demotes that heap to pinned so future disjoint evictable allocations never share it,
+    /// and releasing the evictable user preserves the aliased page for the surviving pinned user.
+    #[test]
+    fn gpu_pinned_alias_on_evictable_guest_page_demotes_heap_and_survives_release() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            }
+            let dev = dev.unwrap();
+            if !tier2(&dev) {
+                crate::gpu::recomp::runner::skip_test("no tiled tier 2");
+                return;
+            }
+
+            let tex_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 512,
+                Height: 512,
+                DepthOrArraySize: 1,
+                MipLevels: 2,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let mut tex_evict: Option<ID3D12Resource> = None;
+            let mut tex_other: Option<ID3D12Resource> = None;
+            let mut alias_res: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&tex_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tex_evict).unwrap();
+            dev.CreateReservedResource(&tex_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tex_other).unwrap();
+            dev.CreateReservedResource(&tex_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut alias_res).unwrap();
+            let (tex_evict, tex_other, alias_res) = (tex_evict.unwrap(), tex_other.unwrap(), alias_res.unwrap());
+
+            let (lv, total) = level_tiling(&dev, &tex_evict, 2);
+            let lv = lv.expect("512x512 RGBA8 with 2 mips has separate tile groups");
+            let (sub0, first0, n0, _) = lv.groups[0];
+            assert!(n0 >= 1 && lv.groups.len() >= 2);
+
+            let mut pages = Pages::new(&dev).unwrap();
+            let va_evict = 0x10_0000_0000usize;
+            let (u_evict, ue_evict) = pages.bind_range(&dev, &tex_evict, va_evict, None, total, sub0, first0 as usize..(first0 + n0) as usize, true).unwrap();
+            assert!(!u_evict.is_empty());
+            let first_page = u_evict[0];
+            let (evict_heap, _) = pages.pages.get(&first_page).unwrap().tile;
+            assert_eq!(pages.pool.heap_evictable.get(evict_heap as usize).copied(), Some(true));
+
+            // Pin an alias over the same guest pages: heap must demote from evictable to pinned.
+            let (u_alias, ue_alias) = pages.bind_range(&dev, &alias_res, va_evict, None, total, sub0, first0 as usize..(first0 + n0) as usize, false).unwrap();
+            assert_eq!(pages.pages.get(&first_page).unwrap().users, 2);
+            assert_eq!(pages.pool.heap_evictable.get(evict_heap as usize).copied(), Some(false));
+
+            // Subsequent evictable allocations must skip the demoted heap and use an evictable heap.
+            let va_other = 0x20_0000_0000usize;
+            let (u_other, ue_other) = pages.bind_range(&dev, &tex_other, va_other, None, total, sub0, first0 as usize..(first0 + n0) as usize, true).unwrap();
+            let (other_heap, _) = pages.pages.get(&u_other[0]).unwrap().tile;
+            assert_ne!(other_heap, evict_heap, "evictable allocation must not reuse heap demoted by pinned alias");
+            assert_eq!(pages.pool.heap_evictable.get(other_heap as usize).copied(), Some(true));
+
+            // Also cover extra_pages (> own): isolate extra_pages demotion by using console_bytes = Some(0)
+            // so all tiles land in extra_pages without self.pages also demoting the same heap.
+            let small_va = 0x30_0000_0000usize;
+            let small_bytes = Some(0u64);
+            assert!(n0 >= 2);
+            let (u_small_ev, ue_small_ev) = pages.bind_range(&dev, &tex_evict, small_va, small_bytes, total, sub0, 0..2, true).unwrap();
+            assert!(u_small_ev.is_empty());
+            assert_eq!(ue_small_ev.len(), 2);
+            let extra_key = ue_small_ev[0];
+            let (extra_heap, _) = pages.extra_pages.get(&extra_key).unwrap().tile;
+            assert_eq!(pages.pool.heap_evictable.get(extra_heap as usize).copied(), Some(true));
+            let (u_small_pin, ue_small_pin) = pages.bind_range(&dev, &alias_res, small_va, small_bytes, total, sub0, 0..2, false).unwrap();
+            assert!(u_small_pin.is_empty());
+            assert_eq!(pages.extra_pages.get(&extra_key).unwrap().users, 2);
+            assert_eq!(pages.pool.heap_evictable.get(extra_heap as usize).copied(), Some(false));
+
+            // Release the evictable user: aliased pages remain live with users == 1 for pinned holder.
+            let t0 = Instant::now();
+            pages.release_tiles(u_evict, ue_evict, t0, false);
+            pages.release_tiles(u_small_ev, ue_small_ev, t0, false);
+            assert_eq!(pages.pages.get(&first_page).unwrap().users, 1);
+            assert_eq!(pages.extra_pages.get(&extra_key).unwrap().users, 1);
+
+            pages.release_tiles(u_alias, ue_alias, t0, false);
+            pages.release_tiles(u_small_pin, ue_small_pin, t0, false);
+            pages.release_tiles(u_other, ue_other, t0, false);
+        }
     }
 }

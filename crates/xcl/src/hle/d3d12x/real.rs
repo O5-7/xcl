@@ -1926,6 +1926,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
         return f(this, desc, cpu);
     };
+    super::vram::untrack_srv(slot.pc_srv);
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
@@ -2691,17 +2692,20 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
                     let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
                     g(this, std::ptr::null_mut(), &srv, slot.pc_srv);
                     super::console_heap::publish(&slot, false);
+                    super::vram::untrack_srv(slot.pc_srv);
                 }
                 let fmt = crate::gpu::desc::gfx10_format(v.Format).unwrap_or(0);
                 return super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, 1, 1, 1, 1));
             }
         }
+        super::vram::untrack_srv(slot.pc_srv);
         return super::console_heap::write(&slot, &[0; 8]);
     };
     let rd = rd_opt.unwrap();
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        super::vram::untrack_srv(slot.pc_srv);
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
@@ -2722,6 +2726,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
+        super::vram::untrack_srv(slot.pc_srv);
         return super::console_heap::write(&slot, &[0; 8]);
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read any image UAV slot
@@ -2732,6 +2737,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
         g(this, srv_res, &srv, slot.pc_srv);
         super::console_heap::publish(&slot, false);
+        super::vram::untrack_srv(slot.pc_srv);
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
     let d = if dim == 8 { (d >> mip).max(1) } else { d };
@@ -9000,6 +9006,164 @@ void main() {
                 "companion SRVs (1D, 1DArray, 2D, 2DArray, 3D), null image views, and copied staging slots must all read back accurately"
             );
         }
+    }
+
+    fn with_tracked_uav_slot_test(f: impl FnOnce(&ID3D12Device, &ID3D12Resource, u64, u64, u64, u64)) {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut dev_opt: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev_opt).is_err() {
+                crate::gpu::recomp::runner::skip_test("no D3D12 hardware GPU");
+                return;
+            }
+            let dev = dev_opt.unwrap();
+            adopt(dev.as_raw(), Kind::Device);
+
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 8,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("shader-visible heap");
+            let pc_cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+            let pc_gpu = heap.GetGPUDescriptorHandleForHeapStart().ptr;
+            let heap_key = heap.as_raw() as usize;
+            assert!(super::super::console_heap::register(heap_key, 4, pc_cpu, pc_gpu, inc, false, false, true));
+            let base_cpu = super::super::console_heap::start(heap_key).expect("console heap start");
+            let slot0_cpu = base_cpu;
+            let slot1_cpu = base_cpu + super::super::console_heap::SLOT as u64;
+            let pc_srv0 = super::super::console_heap::slot(slot0_cpu).expect("slot 0").pc_srv;
+            let pc_srv1 = super::super::console_heap::slot(slot1_cpu).expect("slot 1").pc_srv;
+
+            let tex_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R32_UINT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut tex_opt: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &tex_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut tex_opt,
+            )
+            .expect("texture");
+            let tex = tex_opt.unwrap();
+            let tex_key = tex.as_raw() as usize;
+
+            struct Guard(usize, u64, u64, usize);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    super::super::vram::untrack_srv(self.1);
+                    super::super::vram::untrack_srv(self.2);
+                    super::super::vram::forget_placed_texture_for_test(self.3);
+                    super::super::vram::BUDGET_EVICT_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+                    super::super::console_heap::unregister(self.0);
+                }
+            }
+
+            super::super::vram::BUDGET_EVICT_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+            super::super::vram::note_placed_texture_for_test(tex_key);
+            let _guard = Guard(heap_key, pc_srv0, pc_srv1, tex_key);
+
+            f(&dev, &tex, slot0_cpu, slot1_cpu, pc_srv0, pc_srv1);
+        }
+    }
+
+    #[test]
+    fn null_texture_uav_overwrite_clears_tracked_srv_before_console_copy() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+
+        with_tracked_uav_slot_test(|dev, tex, slot0_cpu, slot1_cpu, pc_srv0, pc_srv1| unsafe {
+            let tex_key = tex.as_raw() as usize;
+            let srv_2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, ..Default::default() },
+                },
+            };
+            let null_uav_2d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            };
+            let heap_ty = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32;
+
+            dev_create_srv_x(dev.as_raw(), tex.as_raw(), &srv_2d, slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), Some(tex_key));
+
+            dev_create_uav_x(dev.as_raw(), std::ptr::null_mut(), std::ptr::null_mut(), &null_uav_2d, slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), None);
+            assert!(copy_console_slots(dev.as_raw(), 1, slot1_cpu, slot0_cpu, heap_ty));
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv1), None);
+
+            // Also verify image UAV and CBV overwrites clear stale tracked SRVs before copy.
+            dev_create_srv_x(dev.as_raw(), tex.as_raw(), &srv_2d, slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), Some(tex_key));
+            dev_create_uav_x(dev.as_raw(), tex.as_raw(), std::ptr::null_mut(), &null_uav_2d, slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), None);
+            assert!(copy_console_slots(dev.as_raw(), 1, slot1_cpu, slot0_cpu, heap_ty));
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv1), None);
+
+            dev_create_srv_x(dev.as_raw(), tex.as_raw(), &srv_2d, slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), Some(tex_key));
+            dev_create_cbv_x(dev.as_raw(), std::ptr::null(), slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), None);
+            assert!(copy_console_slots(dev.as_raw(), 1, slot1_cpu, slot0_cpu, heap_ty));
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv1), None);
+        });
+    }
+
+    #[test]
+    fn unsupported_texture_uav_without_companion_preserves_tracked_srv_before_console_copy() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+
+        with_tracked_uav_slot_test(|dev, tex, slot0_cpu, slot1_cpu, pc_srv0, pc_srv1| unsafe {
+            let tex_key = tex.as_raw() as usize;
+            let srv_2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, ..Default::default() },
+                },
+            };
+            // ViewDimension 6 (Texture2DMS) passes `view_shape` while `uav_companion_srv` returns
+            // `None` and leaves `slot.pc_srv` untouched, so SRV tracking must remain intact.
+            let unsupported_tex_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION(6),
+                ..Default::default()
+            };
+            let heap_ty = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32;
+
+            dev_create_srv_x(dev.as_raw(), tex.as_raw(), &srv_2d, slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), Some(tex_key));
+
+            dev_create_uav_x(dev.as_raw(), tex.as_raw(), std::ptr::null_mut(), &unsupported_tex_uav, slot0_cpu);
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv0), Some(tex_key));
+
+            assert!(copy_console_slots(dev.as_raw(), 1, slot1_cpu, slot0_cpu, heap_ty));
+            assert_eq!(super::super::vram::tracked_srv_resource(pc_srv1), Some(tex_key));
+        });
     }
 }
 
